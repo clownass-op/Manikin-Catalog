@@ -95,6 +95,23 @@ def read_previous_count(meta_path):
         return 0
 
 
+def read_existing_rows(gz_path):
+    try:
+        with gzip.open(gz_path, "rt", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def read_existing_raw(gz_path):
+    try:
+        with gzip.open(gz_path, "rb") as handle:
+            return handle.read()
+    except Exception:
+        return b""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Snapshot the Supabase swfs catalog.")
     parser.add_argument("--out", default=".", help="directory to write into (default: .)")
@@ -118,11 +135,6 @@ def main():
     if not rows:
         fail("the API returned no rows - refusing to commit an empty catalog")
 
-    # Mirror the table exactly, but in a fixed order so gzip output is
-    # byte-identical when nothing changed (that is what keeps commits quiet).
-    rows.sort(key=lambda r: ((r.get("path") or ""), (r.get("category") or ""),
-                             (r.get("name") or "")))
-
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
     gz_path = os.path.join(out_dir, "catalog.json.gz")
@@ -133,7 +145,29 @@ def main():
         fail("only %d rows, down from %d (%.0f%%) - refusing what looks like a "
              "truncated read" % (len(rows), previous, 100.0 * len(rows) / previous))
 
+    # Union with what the file already holds: items added straight to the repo
+    # (CatalogSync, Settings > Catalog) must survive a refresh from Supabase. On
+    # a shared path the table wins, so edits made there still land here.
+    merged = {}
+    for row in read_existing_rows(gz_path):
+        if row.get("path"):
+            merged[row["path"]] = row
+    for row in rows:
+        if row.get("path"):
+            merged[row["path"]] = row
+    if not merged:
+        fail("the mirror and the API are both empty - nothing to publish")
+
+    # Fixed order so unchanged data is byte-identical and commits stay quiet.
+    rows = sorted(merged.values(), key=lambda r: ((r.get("path") or ""), (r.get("category") or ""),
+                                                  (r.get("name") or "")))
+
     raw = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # Compare uncompressed content: Python and the app gzip differently, so the
+    # compressed bytes alone would look like a change after a GitHub-side edit.
+    if raw == read_existing_raw(gz_path):
+        print("catalog unchanged (%d rows) - nothing to write" % len(rows))
+        return
 
     tmp_path = gz_path + ".tmp"
     with open(tmp_path, "wb") as handle:
