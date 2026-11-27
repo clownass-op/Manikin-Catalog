@@ -31,6 +31,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# Field order of a published row, and of every row on disk: name first, meta
+# last. CatalogSync.cs holds the same list, so an app-side add and a snapshot
+# produce the same bytes for the same catalog.
+FIELDS = ("name", "path", "category", "item_group", "link", "meta")
+
 PAGE = 1000          # PostgREST rows per request (Supabase's default max)
 RETRIES = 4          # transient 5xx/timeouts per page
 MAX_PAGES = 400      # sanity cap: 400k rows
@@ -85,6 +90,15 @@ def fetch_page(ep, key, offset):
                   file=sys.stderr)
             time.sleep(wait)
     fail("page at offset %d failed: %s" % (offset, last))
+
+
+def canonical(row):
+    """Same row, known fields first in FIELDS order, anything else after them."""
+    out = {key: row[key] for key in FIELDS if key in row}
+    for key, value in row.items():
+        if key not in out:
+            out[key] = value
+    return out
 
 
 def read_previous_count(meta_path):
@@ -161,8 +175,12 @@ def main():
     # Fixed order so unchanged data is byte-identical and commits stay quiet.
     rows = sorted(merged.values(), key=lambda r: ((r.get("path") or ""), (r.get("category") or ""),
                                                   (r.get("name") or "")))
+    rows = [canonical(row) for row in rows]
 
-    raw = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # Indented, one field per line: this is the catalog people read and diff by
+    # hand, and pretty-printing costs about 40 KB gzipped out of 1.6 MB. LF
+    # regardless of platform so the app's writer and this one agree byte for byte.
+    raw = (json.dumps(rows, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     # Compare uncompressed content: Python and the app gzip differently, so the
     # compressed bytes alone would look like a change after a GitHub-side edit.
     if raw == read_existing_raw(gz_path):
